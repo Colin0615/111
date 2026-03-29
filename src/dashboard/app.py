@@ -23,6 +23,10 @@ from src.market.client import fetch_active_markets, categorize_market
 from src.analysis.ai_analyzer import quick_scan, deep_analysis
 from src.news.collector import search_news_for_market
 from src.strategy.signals import generate_signal, check_risk, rank_signals
+from src.strategy.ensemble import ensemble_predict
+from src.strategy.calibration import get_calibration_stats
+from src.strategy.cascade import detect_cascade, contrarian_signal
+from src.strategy.portfolio import optimize_allocations
 from src.execution.paper_trader import execute_paper_trade, update_positions_pnl
 
 
@@ -157,6 +161,65 @@ async def api_history(request: Request) -> JSONResponse:
     return JSONResponse({"trades": trades})
 
 
+async def api_ensemble(request: Request) -> JSONResponse:
+    """Run ensemble prediction for a market."""
+    condition_id = request.query_params.get("id", "")
+    if not condition_id:
+        return JSONResponse({"error": "Missing 'id' parameter"}, status_code=400)
+
+    try:
+        markets = await fetch_active_markets(limit=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+    market = next((m for m in markets if m.get("condition_id") == condition_id), None)
+    if not market:
+        return JSONResponse({"error": "Market not found"}, status_code=404)
+
+    news = await search_news_for_market(market)
+    from src.analysis.ai_analyzer import _build_news_section
+    news_text = _build_news_section(news)
+
+    result = await ensemble_predict(market, news_context=news_text)
+    return JSONResponse({
+        "market": market,
+        "ensemble": result,
+        "edge": result["ensemble_probability"] - market.get("yes_price", 0.5),
+    })
+
+
+async def api_calibration(request: Request) -> JSONResponse:
+    """Get calibration statistics."""
+    stats = get_calibration_stats()
+    return JSONResponse(stats)
+
+
+async def api_strategy(request: Request) -> JSONResponse:
+    """Get combined strategy signals for a market (cascade, portfolio optimization)."""
+    condition_id = request.query_params.get("id", "")
+    result = {}
+
+    # Calibration stats always available
+    result["calibration"] = get_calibration_stats()
+
+    # Portfolio optimization info
+    positions = await db.get_open_positions()
+    portfolio = await db.get_portfolio()
+    cash = portfolio.get("cash", 0) if portfolio else 0
+    result["portfolio_state"] = {
+        "open_positions": len(positions),
+        "cash_available": cash,
+        "categories": {},
+    }
+    for pos in positions:
+        cat = pos.get("category", "other")
+        result["portfolio_state"]["categories"][cat] = (
+            result["portfolio_state"]["categories"].get(cat, 0) + 1
+        )
+
+    return JSONResponse(result)
+
+
 async def index(request: Request) -> HTMLResponse:
     return HTMLResponse(DASHBOARD_HTML)
 
@@ -171,6 +234,9 @@ app = Starlette(
         Route("/api/analyze", api_analyze),
         Route("/api/trade", api_trade, methods=["POST"]),
         Route("/api/history", api_history),
+        Route("/api/ensemble", api_ensemble),
+        Route("/api/calibration", api_calibration),
+        Route("/api/strategy", api_strategy),
     ],
 )
 
@@ -424,6 +490,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="nav">
     <button class="nav-btn active" onclick="showSection('overview')">Overview</button>
     <button class="nav-btn" onclick="showSection('scan')">Market Scan</button>
+    <button class="nav-btn" onclick="showSection('strategy')">Strategy</button>
     <button class="nav-btn" onclick="showSection('positions')">Positions</button>
     <button class="nav-btn" onclick="showSection('history')">History</button>
   </div>
@@ -460,6 +527,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div id="analysis-panel"></div>
+  </div>
+
+  <!-- STRATEGY -->
+  <div id="section-strategy" class="section">
+    <div class="cards" id="calibration-cards"></div>
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Prediction Calibration</span>
+        <button class="btn btn-outline" onclick="loadStrategy()">Refresh</button>
+      </div>
+      <div id="calibration-detail" style="padding:20px">
+        <div class="empty"><p>Loading calibration data...</p></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Ensemble Analysis</span>
+      </div>
+      <div id="ensemble-panel" style="padding:20px">
+        <div class="empty">
+          <div class="empty-icon">&#129504;</div>
+          <p>Select a market from the Scan tab, then click "Ensemble" to run multi-perspective analysis</p>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Portfolio Allocation</span>
+      </div>
+      <div id="portfolio-allocation" style="padding:20px">
+        <div class="empty"><p>Loading...</p></div>
+      </div>
+    </div>
   </div>
 
   <!-- POSITIONS -->
@@ -501,6 +601,7 @@ function showSection(name) {
 
   if (name === 'overview' || name === 'positions') loadPortfolio();
   if (name === 'history') loadHistory();
+  if (name === 'strategy') loadStrategy();
 }
 
 // ── Portfolio ──
@@ -649,6 +750,7 @@ function renderScanResults(results) {
       <td>${signalHtml}</td>
       <td>
         <button class="btn btn-outline" style="padding:4px 10px;font-size:12px" onclick="deepAnalyze('${m.condition_id}')">Analyze</button>
+        <button class="btn btn-outline" style="padding:4px 10px;font-size:12px;margin-left:4px;border-color:var(--blue);color:var(--blue)" onclick="runEnsemble('${m.condition_id}')">Ensemble</button>
         ${s ? `<button class="btn btn-success" style="padding:4px 10px;font-size:12px;margin-left:4px" onclick="paperTrade('${m.condition_id}')">Trade</button>` : ''}
       </td>
     </tr>`;
@@ -770,6 +872,133 @@ function showToast(msg, type = 'success') {
   el.textContent = msg;
   el.className = 'toast toast-' + type + ' show';
   setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ── Ensemble ──
+async function runEnsemble(conditionId) {
+  showSection('strategy');
+  const panel = document.getElementById('ensemble-panel');
+  panel.innerHTML = '<div style="text-align:center;padding:20px"><span class="spinner"></span> Running 3-perspective ensemble analysis...</div>';
+
+  try {
+    const resp = await fetch('/api/ensemble?id=' + encodeURIComponent(conditionId));
+    const data = await resp.json();
+    if (data.error) {
+      panel.innerHTML = `<div style="color:var(--red);padding:20px">${data.error}</div>`;
+      return;
+    }
+    renderEnsemble(panel, data);
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--red);padding:20px">Error: ${e.message}</div>`;
+  }
+}
+
+function renderEnsemble(panel, data) {
+  const m = data.market;
+  const e = data.ensemble;
+  const edge = data.edge || 0;
+  const edgeClass = Math.abs(edge) >= 0.08 ? 'positive' : '';
+
+  let perspectivesHtml = '';
+  for (const p of (e.predictions || [])) {
+    const probPct = (p.probability * 100).toFixed(1);
+    const barW = Math.min(probPct * 2, 160);
+    perspectivesHtml += `
+      <div style="margin:12px 0;padding:12px;background:var(--surface);border-radius:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <strong style="font-size:13px">${p.model}</strong>
+          <span style="font-size:14px;font-weight:700">${probPct}%</span>
+        </div>
+        <div style="background:var(--surface2);border-radius:4px;height:8px;margin-bottom:8px">
+          <div style="background:var(--accent);height:8px;border-radius:4px;width:${barW}px"></div>
+        </div>
+        <div style="font-size:12px;color:var(--text-dim)">${p.reasoning}</div>
+      </div>`;
+  }
+
+  panel.innerHTML = `
+    <h3 style="margin-bottom:12px">${m.question}</h3>
+    <div class="cards" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
+      <div class="card"><div class="card-label">Market YES</div><div class="card-value">$${(m.yes_price||0).toFixed(3)}</div></div>
+      <div class="card"><div class="card-label">Ensemble Prob</div><div class="card-value">${(e.ensemble_probability*100).toFixed(1)}%</div></div>
+      <div class="card"><div class="card-label">Edge</div><div class="card-value ${edgeClass}">${(edge*100).toFixed(1)}%</div></div>
+      <div class="card"><div class="card-label">Spread</div><div class="card-value">${(e.spread*100).toFixed(1)}%</div></div>
+    </div>
+    <div style="margin-bottom:12px;font-size:13px;color:var(--text-dim)">
+      Raw avg: ${(e.raw_average*100).toFixed(1)}% → Extremized (d=${e.extremization_factor}): ${(e.ensemble_probability*100).toFixed(1)}%
+    </div>
+    <h4 style="margin-bottom:8px">Perspectives</h4>
+    ${perspectivesHtml}
+  `;
+}
+
+// ── Strategy ──
+async function loadStrategy() {
+  try {
+    const resp = await fetch('/api/strategy');
+    const data = await resp.json();
+    renderCalibration(data);
+  } catch (e) {
+    document.getElementById('calibration-detail').innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+function renderCalibration(data) {
+  const cal = data.calibration || {};
+  const ps = data.portfolio_state || {};
+
+  document.getElementById('calibration-cards').innerHTML = `
+    <div class="card">
+      <div class="card-label">Total Predictions</div>
+      <div class="card-value">${cal.total_predictions || 0}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Resolved</div>
+      <div class="card-value">${cal.resolved || 0}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Brier Score</div>
+      <div class="card-value">${cal.brier_score != null ? cal.brier_score.toFixed(4) : 'N/A'}</div>
+      <div class="card-sub" style="color:var(--text-dim)">Lower is better (0=perfect)</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Accuracy</div>
+      <div class="card-value">${cal.accuracy != null ? (cal.accuracy*100).toFixed(1)+'%' : 'N/A'}</div>
+    </div>
+  `;
+
+  let detailHtml = '';
+  if (cal.brier_score != null) {
+    detailHtml = `
+      <table><tr><th>Metric</th><th>Value</th><th>What it means</th></tr>
+      <tr><td>Brier Score</td><td><strong>${cal.brier_score.toFixed(4)}</strong></td><td>Overall accuracy (< 0.25 is good)</td></tr>
+      <tr><td>Calibration Error</td><td>${cal.calibration_error.toFixed(4)}</td><td>How well probabilities match outcomes</td></tr>
+      <tr><td>Resolution</td><td>${cal.resolution.toFixed(4)}</td><td>Ability to distinguish outcomes (higher = better)</td></tr>
+      <tr><td>Accuracy</td><td>${(cal.accuracy*100).toFixed(1)}%</td><td>Correct direction rate</td></tr>
+      </table>`;
+  } else {
+    detailHtml = `<div style="color:var(--text-dim);text-align:center;padding:20px">${cal.message || 'No resolved predictions yet. Keep trading!'}</div>`;
+  }
+  document.getElementById('calibration-detail').innerHTML = detailHtml;
+
+  // Portfolio allocation
+  const cats = ps.categories || {};
+  const catEntries = Object.entries(cats);
+  let allocHtml = `<div style="font-size:14px;margin-bottom:12px">Open positions: <strong>${ps.open_positions || 0}</strong> | Cash: <strong>$${(ps.cash_available||0).toFixed(2)}</strong></div>`;
+  if (catEntries.length) {
+    allocHtml += '<div style="display:flex;gap:12px;flex-wrap:wrap">';
+    for (const [cat, count] of catEntries) {
+      const colors = {crypto:'var(--yellow)',politics:'var(--blue)',economics:'var(--green)',tech:'var(--blue)',sports:'var(--red)'};
+      allocHtml += `<div style="background:var(--surface2);border-radius:8px;padding:12px 20px;text-align:center">
+        <div style="font-size:12px;color:${colors[cat]||'var(--text-dim)'};text-transform:uppercase;margin-bottom:4px">${cat}</div>
+        <div style="font-size:24px;font-weight:700">${count}</div>
+      </div>`;
+    }
+    allocHtml += '</div>';
+  } else {
+    allocHtml += '<div style="color:var(--text-dim)">No open positions across categories</div>';
+  }
+  document.getElementById('portfolio-allocation').innerHTML = allocHtml;
 }
 
 // ── Clock ──

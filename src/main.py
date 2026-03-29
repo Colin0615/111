@@ -26,6 +26,11 @@ from src.market.client import fetch_active_markets, categorize_market
 from src.analysis.ai_analyzer import quick_scan, deep_analysis
 from src.news.collector import search_news_for_market
 from src.strategy.signals import generate_signal, check_risk, rank_signals
+from src.strategy.ensemble import ensemble_predict
+from src.strategy.calibration import get_calibration_stats, calibrate_probability
+from src.strategy.cascade import detect_cascade, contrarian_signal
+from src.strategy.orderbook import analyze_orderbook
+from src.strategy.portfolio import optimize_allocations
 from src.execution.paper_trader import execute_paper_trade, update_positions_pnl
 
 structlog.configure(
@@ -118,8 +123,8 @@ async def cmd_analyze(condition_id: str):
 
 
 async def cmd_trade(dry_run: bool = True):
-    """Full pipeline: scan → analyze → generate signals → execute paper trades."""
-    console.print(Panel("[bold yellow]Trading Pipeline[/bold yellow]"))
+    """Full pipeline: scan → analyze → generate signals → portfolio optimize → execute."""
+    console.print(Panel("[bold yellow]Trading Pipeline (Advanced)[/bold yellow]"))
 
     # Ensure portfolio exists
     portfolio = await db.get_portfolio()
@@ -127,7 +132,8 @@ async def cmd_trade(dry_run: bool = True):
         await cmd_init()
         portfolio = await db.get_portfolio()
 
-    console.print(f"Cash: [green]${portfolio['cash']:.2f}[/green] | P&L: ${portfolio['total_pnl']:.2f}")
+    cash = portfolio["cash"]
+    console.print(f"Cash: [green]${cash:.2f}[/green] | P&L: ${portfolio['total_pnl']:.2f}")
 
     # Scan markets
     results = await cmd_scan(top_n=15)
@@ -142,33 +148,117 @@ async def cmd_trade(dry_run: bool = True):
 
     # Rank signals
     ranked = rank_signals(signals)
-    console.print(f"\n[bold]Top {len(ranked)} signals:[/bold]")
 
-    for i, sig in enumerate(ranked[:5], 1):
-        color = "green" if sig.strength == "HIGH" else "yellow" if sig.strength == "MEDIUM" else "white"
+    # Portfolio optimization - adjust sizes based on correlation & concentration
+    current_positions = await db.get_open_positions()
+    signal_dicts = [
+        {
+            "condition_id": s.condition_id,
+            "category": next(
+                (m.get("category", "other") for m, _, sig in results if sig and sig.condition_id == s.condition_id),
+                "other",
+            ),
+            "edge": s.edge,
+            "market_price": s.market_price,
+            "confidence": s.confidence,
+            "side": s.side,
+        }
+        for s in ranked
+    ]
+    allocations = optimize_allocations(signal_dicts, current_positions, cash)
+
+    console.print(f"\n[bold]Portfolio Optimizer: {len(allocations)} allocations from {len(ranked)} signals[/bold]")
+    for i, alloc in enumerate(allocations[:5], 1):
+        sig = next((s for s in ranked if s.condition_id == alloc.market_id), None)
+        name = sig.question[:55] if sig else alloc.market_id[:20]
         console.print(
-            f"  {i}. [{color}]{sig.side}[/{color}] {sig.question[:60]}\n"
-            f"     Edge: {sig.edge:.1%} | Size: ${sig.suggested_size_usd:.2f} | "
-            f"Strength: {sig.strength}"
+            f"  {i}. [cyan]{alloc.side}[/cyan] {name}\n"
+            f"     Kelly: ${alloc.raw_kelly_size:.2f} → Adjusted: ${alloc.adjusted_size:.2f} ({alloc.reason})"
         )
 
     if dry_run:
         console.print("\n[dim]Dry run mode. Use 'trade --execute' to paper trade.[/dim]")
         return ranked
 
-    # Execute paper trades for top signals
+    # Execute paper trades using optimized allocations
     executed = []
-    for sig in ranked[:config.trading.max_daily_trades]:
+    for alloc in allocations[:config.trading.max_daily_trades]:
+        sig = next((s for s in ranked if s.condition_id == alloc.market_id), None)
+        if not sig:
+            continue
+        # Override size with portfolio-optimized size
+        sig.suggested_size_usd = alloc.adjusted_size
         approved, reason = await check_risk(sig)
         if approved:
             trade = await execute_paper_trade(sig)
             executed.append(trade)
-            console.print(f"  [green]PAPER TRADE[/green] {sig.side} {sig.question[:50]} @ ${sig.market_price:.3f}")
+            console.print(f"  [green]PAPER TRADE[/green] {sig.side} {sig.question[:50]} @ ${sig.market_price:.3f} (${alloc.adjusted_size:.2f})")
         else:
             console.print(f"  [red]BLOCKED[/red] {sig.question[:50]}: {reason}")
 
     console.print(f"\n[bold]Executed {len(executed)} paper trades[/bold]")
     return executed
+
+
+async def cmd_ensemble(condition_id: str):
+    """Run ensemble prediction with multiple perspectives."""
+    console.print(Panel(f"[bold cyan]Ensemble Prediction: {condition_id[:20]}...[/bold cyan]"))
+
+    markets = await fetch_active_markets(limit=200)
+    market = next((m for m in markets if m["condition_id"] == condition_id), None)
+    if not market:
+        console.print(f"[red]Market not found: {condition_id}[/red]")
+        return
+
+    news = await search_news_for_market(market)
+    from src.analysis.ai_analyzer import _build_news_section
+    news_text = _build_news_section(news)
+
+    console.print(f"Running 3 perspective ensemble on [bold]{market['question'][:60]}[/bold]...")
+    result = await ensemble_predict(market, news_context=news_text)
+
+    table = Table(title="Ensemble Prediction", show_header=False, padding=(0, 2))
+    table.add_column("", style="bold")
+    table.add_column("", justify="right")
+    table.add_row("Market YES Price", f"${market.get('yes_price', 0):.3f}")
+    table.add_row("Raw Average", f"{result['raw_average']:.1%}")
+    table.add_row("Extremized (d=1.5)", f"[bold]{result['ensemble_probability']:.1%}[/bold]")
+    table.add_row("Spread", f"{result['spread']:.1%}")
+    table.add_row("Confidence", f"{result['confidence']:.1f}/10")
+    edge = result['ensemble_probability'] - market.get('yes_price', 0.5)
+    table.add_row("Edge", f"[{'green' if abs(edge) >= 0.08 else 'yellow'}]{edge:+.1%}[/]")
+    console.print(table)
+
+    console.print("\n[bold]Individual Perspectives:[/bold]")
+    for p in result.get("predictions", []):
+        console.print(f"  {p['model']}: {p['probability']:.1%} (conf {p['confidence']}/10)")
+        console.print(f"    [dim]{p['reasoning']}[/dim]")
+
+    return result
+
+
+async def cmd_calibration():
+    """Show calibration statistics."""
+    stats = get_calibration_stats()
+    table = Table(title="Prediction Calibration Stats", show_header=False, padding=(0, 2))
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Total Predictions", str(stats["total_predictions"]))
+    table.add_row("Resolved", str(stats["resolved"]))
+    table.add_row("Pending", str(stats.get("pending", stats["total_predictions"] - stats["resolved"])))
+
+    if stats.get("brier_score") is not None:
+        brier = stats["brier_score"]
+        color = "green" if brier < 0.2 else "yellow" if brier < 0.3 else "red"
+        table.add_row("Brier Score", f"[{color}]{brier:.4f}[/]")
+        table.add_row("Calibration Error", f"{stats['calibration_error']:.4f}")
+        table.add_row("Resolution", f"{stats['resolution']:.4f}")
+        table.add_row("Accuracy", f"{stats['accuracy']:.1%}")
+    else:
+        table.add_row("Status", f"[dim]{stats.get('message', 'Collecting data...')}[/dim]")
+
+    console.print(table)
 
 
 async def cmd_portfolio():
@@ -346,10 +436,12 @@ async def async_main():
             "  [cyan]init[/cyan]              Initialize portfolio ($50)\n"
             "  [cyan]scan[/cyan]              Scan markets for opportunities\n"
             "  [cyan]analyze <id>[/cyan]      Deep-analyze a specific market\n"
-            "  [cyan]trade[/cyan]             Scan + generate signals (dry run)\n"
+            "  [cyan]ensemble <id>[/cyan]     Multi-perspective ensemble prediction\n"
+            "  [cyan]trade[/cyan]             Scan + portfolio-optimized signals (dry run)\n"
             "  [cyan]trade --execute[/cyan]   Scan + paper trade best signals\n"
             "  [cyan]portfolio[/cyan]         Show portfolio status\n"
-            "  [cyan]history[/cyan]           Show trade history\n",
+            "  [cyan]history[/cyan]           Show trade history\n"
+            "  [cyan]calibration[/cyan]       Show prediction calibration stats\n",
             title="Usage: python -m src.main <command>",
         ))
         return
@@ -366,6 +458,11 @@ async def async_main():
             console.print("[red]Usage: analyze <condition_id>[/red]")
             return
         await cmd_analyze(args[1])
+    elif cmd == "ensemble":
+        if len(args) < 2:
+            console.print("[red]Usage: ensemble <condition_id>[/red]")
+            return
+        await cmd_ensemble(args[1])
     elif cmd == "trade":
         execute = "--execute" in args
         await cmd_trade(dry_run=not execute)
@@ -373,6 +470,8 @@ async def async_main():
         await cmd_portfolio()
     elif cmd == "history":
         await cmd_history()
+    elif cmd == "calibration":
+        await cmd_calibration()
     else:
         console.print(f"[red]Unknown command: {cmd}[/red]")
 

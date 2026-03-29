@@ -15,6 +15,7 @@ from typing import Optional
 import anthropic
 
 from src.core.config import config
+from src.strategy.calibration import calibrate_probability, record_prediction
 
 log = structlog.get_logger()
 
@@ -51,8 +52,9 @@ Output ONLY valid JSON (no markdown, no explanation outside JSON):
 """
 
 DEEP_ANALYSIS_PROMPT = """\
-You are an expert prediction market analyst who excels at probability calibration.
+You are a superforecaster applying the Tetlock methodology for prediction markets.
 Your estimates are well-calibrated: when you say 70%, events happen ~70% of the time.
+You systematically avoid overconfidence, anchoring, and confirmation bias.
 
 ## Market Information
 Question: {question}
@@ -66,23 +68,47 @@ Description: {description}
 ## Recent News
 {news_section}
 
-## Analysis Tasks
-1. List 3+ arguments supporting YES
-2. List 3+ arguments supporting NO
-3. Consider base rates: how often do similar events happen?
-4. Assess the news impact on the outcome
-5. Identify what information the market might be missing
-6. Consider: why might the market be wrong?
+## Superforecaster Analysis Framework (follow ALL steps)
+
+### Step 1: OUTSIDE VIEW (Base Rate)
+What is the historical base rate for this type of event? How often do similar things happen?
+Start here BEFORE looking at specifics. Anchor to the base rate first.
+
+### Step 2: INSIDE VIEW (Specific Factors)
+What specific factors make THIS case different from the base rate?
+List factors pushing toward YES and factors pushing toward NO.
+
+### Step 3: SYNTHESIS
+Combine outside and inside views. Adjust from the base rate based on
+the strength of specific evidence. Small adjustments unless evidence is very strong.
+
+### Step 4: RED TEAM (Why You Might Be Wrong)
+- What would change your mind?
+- What information are you missing?
+- Why might the market be right and you wrong?
+- Are you being anchored by the current market price?
+
+### Step 5: CALIBRATION CHECK
+- Is your confidence justified by the evidence quality?
+- Would you bet real money at these odds?
+- Are you in the 30-70% zone where most uncertain events fall?
+
+### Step 6: MARKET INEFFICIENCY CHECK
+- Why would the market misprice this?
+- Is there a structural reason (low liquidity, new market, anchoring)?
+- Or is the market efficient and there is no edge?
 
 ## Output
-Provide your analysis then output this JSON block (MUST be valid JSON):
+Provide your full analysis then output this JSON block (MUST be valid JSON):
 ```json
 {{
   "yes_probability": <your calibrated estimate 0.00-1.00>,
   "confidence": <1-10, where 10 = extremely confident>,
+  "base_rate": <historical base rate if known, else null>,
   "arguments_yes": ["arg1", "arg2", "arg3"],
   "arguments_no": ["arg1", "arg2", "arg3"],
   "market_blind_spots": ["what the market might be missing"],
+  "why_market_might_be_right": ["reason1", "reason2"],
   "recommendation": "BUY_YES" | "BUY_NO" | "SKIP",
   "position_conviction": "HIGH" | "MEDIUM" | "LOW",
   "reasoning": "<detailed reasoning paragraph>"
@@ -210,14 +236,29 @@ async def deep_analysis(
 
     full_text = response.content[0].text
     result = _parse_json_from_response(full_text)
-    ai_prob = float(result.get("yes_probability", 0.5))
+    raw_prob = float(result.get("yes_probability", 0.5))
     market_price = market.get("yes_price", 0.5)
+
+    # Apply calibration correction
+    ai_prob = calibrate_probability(raw_prob)
+
+    # Record prediction for future calibration tracking
+    try:
+        record_prediction(market["condition_id"], ai_prob, config.ai.strong_model)
+    except Exception as e:
+        log.warning("calibration_record_failed", error=str(e))
+
+    log.info("deep_analysis_calibrated",
+             raw_prob=f"{raw_prob:.1%}",
+             calibrated=f"{ai_prob:.1%}",
+             market=f"{market_price:.1%}")
 
     return {
         "condition_id": market["condition_id"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "model": config.ai.strong_model,
         "ai_probability": ai_prob,
+        "raw_probability": raw_prob,
         "confidence": float(result.get("confidence", 5)),
         "market_price": market_price,
         "edge": ai_prob - market_price,
@@ -227,6 +268,8 @@ async def deep_analysis(
         "arguments_yes": result.get("arguments_yes", []),
         "arguments_no": result.get("arguments_no", []),
         "market_blind_spots": result.get("market_blind_spots", []),
+        "why_market_might_be_right": result.get("why_market_might_be_right", []),
+        "base_rate": result.get("base_rate"),
         "position_conviction": result.get("position_conviction", "LOW"),
         "full_response": full_text,
         "raw_result": result,

@@ -261,6 +261,163 @@ def test_rss_parser():
     print(f"  [PASS] RSS parser: {len(articles)} articles parsed")
 
 
+def test_ensemble_extremize():
+    """Test probability extremization."""
+    from src.strategy.ensemble import extremize
+    # Identity-ish at 0.5
+    assert abs(extremize(0.5) - 0.5) < 0.001
+    # Extremize pushes away from 0.5
+    assert extremize(0.6) > 0.6
+    assert extremize(0.4) < 0.4
+    # Boundary values stay put
+    assert extremize(0.01) == 0.01
+    assert extremize(0.99) == 0.99
+    print("  [PASS] extremize")
+
+
+def test_cascade_detection():
+    """Test cascade detection logic."""
+    from src.strategy.cascade import detect_cascade, contrarian_signal
+
+    # Strong cascade: big price move, volume spike, no news, accelerating
+    result = detect_cascade(
+        current_price=0.75,
+        price_history=[0.50, 0.55, 0.60, 0.65, 0.68, 0.72, 0.75],
+        volume_history=[100, 110, 120, 130, 200, 400, 800],
+        has_fundamental_news=False,
+    )
+    assert result["detected"] is True
+    assert result["cascade_probability"] > 0.5
+    assert result["direction"] == "up"
+    print(f"  [PASS] cascade detected: prob={result['cascade_probability']:.2f}, dir={result['direction']}")
+
+    # Contrarian signal
+    signal = contrarian_signal(result, current_price=0.75, market_id="test_market")
+    assert signal is not None
+    assert signal.contrarian_side == "BUY_NO"  # Counter to upward cascade
+    print(f"  [PASS] contrarian signal: {signal.contrarian_side}, overshoot={signal.estimated_overshoot:.1%}")
+
+    # No cascade: stable prices
+    result2 = detect_cascade(
+        current_price=0.50,
+        price_history=[0.49, 0.50, 0.50, 0.51, 0.50],
+        volume_history=[100, 110, 105, 100, 100],
+        has_fundamental_news=False,
+    )
+    assert result2["detected"] is False
+    print("  [PASS] no cascade for stable market")
+
+
+def test_orderbook_analysis():
+    """Test order book analysis."""
+    from src.strategy.orderbook import analyze_orderbook
+
+    # Bullish book: more bid depth
+    book = {
+        "bids": [
+            {"price": "0.50", "size": "500"},
+            {"price": "0.49", "size": "300"},
+            {"price": "0.48", "size": "200"},
+        ],
+        "asks": [
+            {"price": "0.51", "size": "100"},
+            {"price": "0.52", "size": "50"},
+            {"price": "0.53", "size": "30"},
+        ],
+    }
+    signal = analyze_orderbook(book)
+    assert signal.depth_imbalance > 0  # More bids than asks
+    assert signal.signal_direction == "bullish"
+    assert signal.is_liquid  # Good spread and depth
+    print(f"  [PASS] orderbook: imbalance={signal.depth_imbalance}, direction={signal.signal_direction}")
+
+    # Test wall detection
+    book_with_wall = {
+        "bids": [
+            {"price": "0.50", "size": "100"},
+            {"price": "0.49", "size": "100"},
+            {"price": "0.48", "size": "1000"},  # Wall
+        ],
+        "asks": [
+            {"price": "0.51", "size": "100"},
+        ],
+    }
+    signal2 = analyze_orderbook(book_with_wall)
+    assert len(signal2.walls) > 0
+    assert signal2.walls[0]["side"] == "bid"
+    print(f"  [PASS] wall detected at {signal2.walls[0]['price']} (size={signal2.walls[0]['size']})")
+
+
+def test_bayesian_model():
+    """Test Bayesian belief updating."""
+    from src.strategy.bayesian import BayesianModel, Evidence
+
+    model = BayesianModel(prior=0.5)
+    assert abs(model.posterior - 0.5) < 0.001
+
+    # Add positive evidence
+    post = model.add_evidence("Strong positive news", likelihood_ratio=3.0, source_reliability=0.8)
+    assert post > 0.5
+    print(f"  [PASS] Bayesian: prior=50% + positive news → posterior={post:.1%}")
+
+    # Add negative evidence
+    post2 = model.add_evidence("Negative development", likelihood_ratio=0.5, source_reliability=0.9)
+    assert post2 < post  # Should decrease
+    print(f"  [PASS] Bayesian: + negative news → posterior={post2:.1%}")
+
+    # Source reliability shrinks LR toward 1.0
+    e = Evidence("test", likelihood_ratio=4.0, source_reliability=0.5)
+    assert e.adjusted_lr < 4.0 and e.adjusted_lr > 1.0
+    print(f"  [PASS] LR shrinkage: raw=4.0, adjusted={e.adjusted_lr:.2f} (reliability=0.5)")
+
+
+def test_portfolio_optimizer():
+    """Test portfolio allocation optimization."""
+    from src.strategy.portfolio import optimize_allocations
+
+    signals = [
+        {"condition_id": "m1", "category": "crypto", "edge": 0.15, "market_price": 0.60, "confidence": 8, "side": "BUY_YES"},
+        {"condition_id": "m2", "category": "crypto", "edge": 0.12, "market_price": 0.40, "confidence": 7, "side": "BUY_YES"},
+        {"condition_id": "m3", "category": "politics", "edge": 0.10, "market_price": 0.50, "confidence": 6, "side": "BUY_NO"},
+    ]
+    allocations = optimize_allocations(signals, current_positions=[], cash_available=50.0)
+
+    assert len(allocations) > 0
+    total = sum(a.adjusted_size for a in allocations)
+    assert total <= 50.0  # Cannot exceed cash
+    print(f"  [PASS] portfolio optimizer: {len(allocations)} allocations, total=${total:.2f}")
+
+    for a in allocations:
+        assert a.adjusted_size >= 2.0  # Min viable trade
+        print(f"    {a.market_id}: kelly=${a.raw_kelly_size:.2f} → adjusted=${a.adjusted_size:.2f} ({a.reason})")
+
+
+def test_calibration():
+    """Test probability calibration (cold start)."""
+    from src.strategy.calibration import calibrate_probability
+
+    # With no data, should shrink toward 0.5 by 10%
+    cal = calibrate_probability(0.80)
+    assert abs(cal - (0.9 * 0.80 + 0.1 * 0.5)) < 0.001
+    cal2 = calibrate_probability(0.20)
+    assert abs(cal2 - (0.9 * 0.20 + 0.1 * 0.5)) < 0.001
+    print(f"  [PASS] calibration cold start: 0.80 → {cal:.3f}, 0.20 → {cal2:.3f}")
+
+
+def test_cascade_anchoring():
+    """Test anchoring detection."""
+    from src.strategy.cascade import detect_anchoring
+
+    result = detect_anchoring(0.50)
+    assert result["anchored"] is True
+    assert result["anchor_value"] == 0.50
+    print(f"  [PASS] anchoring detected at {result['anchor_value']}")
+
+    result2 = detect_anchoring(0.63)
+    assert result2["anchored"] is False
+    print("  [PASS] no anchoring at 0.63")
+
+
 async def run_all_tests():
     print("\n=== Polymarket AI Trader - Test Suite ===\n")
 
@@ -271,6 +428,15 @@ async def run_all_tests():
     test_signal_ranking()
     test_news_keywords()
     test_rss_parser()
+
+    print("\n[Advanced Strategy Tests]")
+    test_ensemble_extremize()
+    test_cascade_detection()
+    test_orderbook_analysis()
+    test_bayesian_model()
+    test_portfolio_optimizer()
+    test_calibration()
+    test_cascade_anchoring()
 
     print("\n[Integration Tests]")
     await test_risk_checks()
