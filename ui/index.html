@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Polymarket Trader - 控制台</title>
+  <style>
+    :root {
+      --bg:#070b17; --panel:#121a31; --panel-2:#0f1730; --line:#24325f;
+      --text:#e8eeff; --muted:#9eb1ff; --good:#59e1ad; --warn:#ffd166; --bad:#ff6b8a; --accent:#4c76ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background: radial-gradient(circle at 10% -10%, #1a2852, #070b17 45%); color:var(--text); font-family: Inter, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .app { max-width: 1200px; margin: 20px auto; padding: 0 16px 28px; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+    .title { font-size:22px; font-weight:700; }
+    .subtitle { color:var(--muted); font-size:13px; }
+    .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; margin-bottom:12px; }
+    .card { background: linear-gradient(180deg,var(--panel),var(--panel-2)); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 12px 24px rgba(0,0,0,.24); }
+    .c3{grid-column:span 3;} .c4{grid-column:span 4;} .c5{grid-column:span 5;} .c6{grid-column:span 6;} .c7{grid-column:span 7;} .c8{grid-column:span 8;} .c12{grid-column:span 12;}
+    .label { color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .kpi { font-size:28px; font-weight:700; }
+    .good{color:var(--good)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+    table { width:100%; border-collapse: collapse; font-size:13px; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); }
+    th { color:var(--muted); font-weight:600; }
+    .controls { display:flex; gap:8px; flex-wrap: wrap; }
+    .btn { border:1px solid #3550a4; background:#1a2f70; color:#fff; padding:8px 12px; border-radius:10px; cursor:pointer; }
+    .btn.danger { background:#5b1d32; border-color:#8a2b4a; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; border:1px solid #3550a4; color:#c7d6ff; font-size:12px; }
+    .split { display:flex; justify-content:space-between; gap:12px; }
+    .muted { color:var(--muted); }
+    @media (max-width:900px){ .c3,.c4,.c5,.c6,.c7,.c8,.c12{grid-column:span 12;} }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div>
+        <div class="title">AI Polymarket Trader</div>
+        <div class="subtitle">研究/回测/模拟/实盘一体化控制台（原型）</div>
+      </div>
+      <span class="pill">Mode: Paper Trading</span>
+    </div>
+
+    <div class="row">
+      <div class="card c3"><div class="label">账户净值</div><div class="kpi">$50.00</div></div>
+      <div class="card c3"><div class="label">今日PnL</div><div class="kpi good">+$1.24</div></div>
+      <div class="card c3"><div class="label">最大回撤</div><div class="kpi warn">-3.8%</div></div>
+      <div class="card c3"><div class="label">风险状态</div><div class="kpi good">正常</div></div>
+    </div>
+
+    <div class="row">
+      <div class="card c8">
+        <div class="split">
+          <div>
+            <div class="label">候选交易信号（模型融合输出）</div>
+            <div class="muted">综合：新闻情绪 + 盘口微结构 + 一致性检查</div>
+          </div>
+          <div class="controls">
+            <button class="btn">刷新信号</button>
+            <button class="btn">导出日报</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>市场</th><th>方向</th><th>置信度</th><th>建议仓位</th><th>TTL</th><th>状态</th></tr></thead>
+          <tbody>
+            <tr><td>BTC 24h Up/Down</td><td>YES</td><td>0.67</td><td>$3.0</td><td>6m</td><td class="good">可执行</td></tr>
+            <tr><td>ETH 24h Up/Down</td><td>NO</td><td>0.55</td><td>$1.5</td><td>5m</td><td class="warn">观察</td></tr>
+            <tr><td>Macro Event A</td><td>YES</td><td>0.51</td><td>$0.8</td><td>3m</td><td class="bad">拒绝（风险）</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card c4">
+        <div class="label">风控开关</div>
+        <p>单笔风险: <b>1.5%</b></p>
+        <p>日亏损上限: <b>4%</b></p>
+        <p>连续亏损: <b>2</b></p>
+        <div class="controls">
+          <button class="btn">仅模拟</button>
+          <button class="btn danger">一键停机</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card c7">
+        <div class="label">执行日志（最近5条）</div>
+        <table>
+          <thead><tr><th>时间</th><th>动作</th><th>价格</th><th>数量</th><th>结果</th><th>滑点</th></tr></thead>
+          <tbody>
+            <tr><td>09:30:12</td><td>BUY YES BTC</td><td>0.47</td><td>6</td><td>Filled</td><td>0.2%</td></tr>
+            <tr><td>09:45:41</td><td>SELL YES BTC</td><td>0.52</td><td>6</td><td>Filled</td><td>0.1%</td></tr>
+            <tr><td>10:15:06</td><td>BUY NO ETH</td><td>0.55</td><td>3</td><td>Partial</td><td>0.4%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card c5">
+        <div class="label">LLM 决策链健康度</div>
+        <p>LLM-A 研究员: <span class="good">在线</span>（事件抽取延迟 620ms）</p>
+        <p>LLM-B 交易员: <span class="good">在线</span>（候选单通过率 41%）</p>
+        <p>LLM-C 审计员: <span class="warn">在线</span>（拦截率 18%）</p>
+        <p>规则风控: <b>硬拦截启用</b></p>
+        <div class="controls">
+          <button class="btn">查看提示词版本</button>
+          <button class="btn">回放决策链</button>
+        </div>
+      </div>
+
+      <div class="card c5">
+        <div class="label">实验引擎（自学习）</div>
+        <p>当前实验: <b>EXP-2026-03-29-07</b></p>
+        <p>假设: 缩短情绪衰减半衰期（4h → 2h）</p>
+        <p>状态: <span class="warn">模拟中</span></p>
+        <p>门槛: PnL>0 且 MaxDD<15% 且 Brier 优于基线</p>
+        <div class="controls">
+          <button class="btn">查看报告</button>
+          <button class="btn">申请晋升</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
