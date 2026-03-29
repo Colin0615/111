@@ -8,6 +8,38 @@
 
 **Tech Stack:** Python 3.11+, FastAPI, Claude API/OpenAI API, py-clob-client, PostgreSQL, Redis, Celery, WebSocket, Docker
 
+**预算参考:** 入门 ~$35/月, 中等 ~$270/月, 专业 ~$1,300/月 (详见 docs/research/practical_details.md)
+
+---
+
+## ⚡ Quick Start: MVP 最小可行原型 [建议最先执行, 2-3天]
+
+> 在构建完整系统之前，先用最小代码验证核心假设：AI 概率估计是否真的比市场价格更准确？
+
+### MVP Step 1: 连接 Polymarket (2小时)
+- [ ] `pip install py-clob-client web3==6.14.0`
+- [ ] 创建 Polygon EOA 钱包，获取私钥
+- [ ] 编写连接脚本，拉取所有活跃市场列表
+- [ ] 选择 5-10 个高流动性市场进行监控
+- [ ] 存储市场数据到 CSV/SQLite
+
+### MVP Step 2: AI 概率估计 (4小时)
+- [ ] 用 Claude API (Sonnet) 分析每个目标市场
+- [ ] Prompt: 给出市场问题 + 网上可搜索到的信息 → 输出 YES 概率
+- [ ] 记录: AI 概率 vs 市场价格 → 计算 edge
+- [ ] 每天运行一次，持续 3-5 天收集数据
+
+### MVP Step 3: 验证 Edge (1天)
+- [ ] 统计 AI 预测 vs 市场价格 vs 最终结果
+- [ ] 计算: 如果按 AI 信号交易，理论盈亏是多少？
+- [ ] **关键决策点**: Edge 是否真实存在？ > 5% 才值得继续
+
+### MVP Step 4: 手动小额测试 (1天)
+- [ ] 向钱包转入 $50 USDC.e
+- [ ] 在 AI 给出高 edge (>10%) 的市场上手动下单
+- [ ] 追踪实际盈亏
+- [ ] **通过此步骤验证后，再进入 Phase 0 构建完整系统**
+
 ---
 
 ## Phase 0: 项目基础设施搭建 [预计2天]
